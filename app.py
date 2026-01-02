@@ -1,4 +1,3 @@
-
 import yfinance as yf
 from tradingview_ta import TA_Handler
 from ddgs import DDGS
@@ -7,8 +6,7 @@ from datetime import datetime
 from openai import OpenAI
 import logging
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
+import mplfinance as mpf
 from fpdf import FPDF
 import streamlit as st
 import concurrent.futures
@@ -38,68 +36,88 @@ def generate_pdf(ticker, name, report_text):
     pdf.set_font("DejaVu", "", 11)
     pdf.multi_cell(0, 8, report_text)
 
-    return bytes(pdf.output(dest="S"))
-
-
+    return bytes(pdf.output(dest="s"))
 # --- 1. REFINED TECHNICAL FUNCTIONS ---
 
-def calculate_rsi(series, period=14):
-    """Calculates RSI using Wilder's Smoothing Method (Standard for TradingView)."""
-    delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+def create_stock_chart(symbol):
+    symbol = symbol.strip().upper()
 
-    # Wilder's Smoothing: Exponential Moving Average with alpha = 1/period
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    if symbol.endswith(".NS"):
+        symbol = symbol.replace(".NS", "")
 
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+    full_symbol = f"{symbol}.NS"
+    try:
+        # Fetch data
+        df = yf.Ticker(full_symbol).history(period="6mo", interval="1d")
+        if df.empty:
+            logger.warning(f"No data found for symbol: {symbol}")
+            return None
 
-def plot_stock_with_indicators(ticker: str, period: str = "6mo") -> go.Figure | None:
-    symbol = ticker.strip().upper()
-    if not symbol.endswith(".NS"):
-        symbol += ".NS"
+        df = df[["Open", "High", "Low", "Close", "Volume"]].copy()
 
-    data = yf.Ticker(symbol).history(period=period, interval="1d")
-    if data.empty:
+        # Calculate EMAs
+        df["EMA10"] = df["Close"].ewm(span=10, adjust=False).mean()
+        df["EMA20"] = df["Close"].ewm(span=20, adjust=False).mean()
+        df["EMA50"] = df["Close"].ewm(span=50, adjust=False).mean()
+
+        # Calculate RSI
+        delta = df["Close"].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        period = 14
+        avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+        avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+        rs = avg_gain / avg_loss
+        df["RSI"] = 100 - (100 / (1 + rs))
+
+        # Prepare last 150 candles
+        plot_df = df.iloc[-100:].copy()
+        plot_df.index.name = "Date"
+
+        # Styling
+        mc = mpf.make_marketcolors(
+            up='green',
+            down='red',
+            edge='inherit',
+            wick='#fff',
+            volume='in',
+            ohlc='i'
+        )
+        style = mpf.make_mpf_style(
+            base_mpf_style="nightclouds",
+            facecolor="#121212",
+            gridcolor="#333",
+            marketcolors=mc
+        )
+
+        # Addplots
+        apds = []
+        for col in ["EMA10", "EMA20", "EMA50"]:
+            if col in plot_df.columns:
+                apds.append(mpf.make_addplot(plot_df[col], panel=0, width=1))
+
+        if "RSI" in plot_df.columns:
+            apds.extend([
+                mpf.make_addplot(plot_df["RSI"], panel=1, color="orange", ylabel="RSI"),
+                mpf.make_addplot([60] * len(plot_df), panel=1, color="gray", linestyle="--"),
+                mpf.make_addplot([40] * len(plot_df), panel=1, color="gray", linestyle="--"),
+            ])
+
+        # Generate plot
+        fig, _ = mpf.plot(
+            plot_df,
+            type="candle",
+            style=style,
+            addplot=apds,
+            volume=False,
+            panel_ratios=(3, 1),
+            figsize=(14, 8),
+            returnfig=True
+        )
+        return fig
+
+    except Exception as e:
         return None
-
-    # Technical Indicators
-    data["EMA10"] = data["Close"].ewm(span=10, adjust=False).mean()
-    data["EMA20"] = data["Close"].ewm(span=20, adjust=False).mean()
-    data["EMA50"] = data["Close"].ewm(span=50, adjust=False).mean()
-    data["RSI"] = calculate_rsi(data["Close"])
-
-
-    data = data.iloc[-120:].copy()
-
-    fig = make_subplots(
-        rows=2, cols=1, shared_xaxes=True,
-        vertical_spacing=0.05, row_heights=[0.7, 0.3],
-    )
-
-    # Candlestick
-    fig.add_trace(go.Candlestick(
-        x=data.index, open=data["Open"], high=data["High"],
-        low=data["Low"], close=data["Close"], name="Price",
-        increasing_line_color='#00c853', decreasing_line_color='#ff5252'
-    ), row=1, col=1)
-
-    # EMAs
-    fig.add_trace(go.Scatter(x=data.index, y=data["EMA10"], name="EMA 10", line=dict(color="#fbc02d", width=1.2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=data.index, y=data["EMA20"], name="EMA 20", line=dict(color="#42a5f5", width=1.2)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=data.index, y=data["EMA50"], name="EMA 50", line=dict(color="#ab47bc", width=1.2)), row=1, col=1)
-
-    # RSI
-    fig.add_trace(go.Scatter(x=data.index, y=data["RSI"], name="RSI", line=dict(color="#66bb6a", width=2)), row=2, col=1)
-    fig.add_hline(y=60, line=dict(color="#ef5350", dash="dot"), row=2, col=1)# type: ignore
-    fig.add_hline(y=40, line=dict(color="#ef5350", dash="dot"), row=2, col=1)# type: ignore
-
-    fig.update_layout(template="plotly_dark", height=600, xaxis_rangeslider_visible=False,
-                      paper_bgcolor="#121212", plot_bgcolor="#121212", hovermode="x unified")
-    return fig
-
 # --- 2. DATA RETRIEVAL (PARALLELIZED) ---
 
 def fetch_fundamentals(symbol: str, full_symbol: str):
@@ -135,10 +153,7 @@ def fetch_fundamentals(symbol: str, full_symbol: str):
 def fetch_technicals(symbol: str):
     try:
         handler = TA_Handler(symbol=symbol, exchange="NSE", screener="india", interval="1d", timeout=10)
-        analysis = handler.get_analysis()
-        if analysis is None:
-            return {}
-        indicators = analysis.indicators
+        indicators = handler.get_analysis().indicators
 
         # RESTORED: Your exact handpicked technical keys
         tech_keys = [
@@ -147,7 +162,7 @@ def fetch_technicals(symbol: str):
             "Pivot.M.Classic.S3", "Pivot.M.Classic.S2", "Pivot.M.Classic.S1",
             "Pivot.M.Classic.Middle", "Pivot.M.Classic.R1", "Pivot.M.Classic.R2", "Pivot.M.Classic.R3"
         ]
-        return {k: round(float(indicators.get(k, 0)), 2) for k in tech_keys if indicators.get(k) is not None}
+        return {k: round(float(indicators.get(k)), 2) for k in tech_keys if indicators.get(k) is not None}
     except Exception:
         return {}
 
@@ -162,7 +177,7 @@ def fetch_news(symbol: str, name: str):
 def fetch_weekly_history(full_symbol: str):
     try:
         df = yf.Ticker(full_symbol).history(period="6mo", interval="1wk")
-        return {str(idx.date()): round(float(val), 2) for idx, val in df["Close"].items()} # type: ignore
+        return {str(idx.date()): round(float(val), 2) for idx, val in df["Close"].items()}
     except Exception:
         return {}
 
@@ -309,8 +324,8 @@ CONSTRAINTS
 st.set_page_config(page_title="NSE Stock AI", layout="wide")
 
 defaults = {
-    "model": "openai/gpt-oss-20b",
-    "base_url": "https://api.groq.com/openai/v1",
+    "model": "",
+    "base_url": "",
     "api_key": ""
 }
 
@@ -323,11 +338,11 @@ for k, v in defaults.items():
 with st.sidebar:
     st.subheader("AI Configuration")
 
-    st.text_input("Model", key="model", placeholder="openai/gpt-oss-20b", autocomplete="off")
+    st.text_input("Model", key="model", placeholder="Ai Model e.g. GPT-4.o", autocomplete="off")
     st.text_input(
         "Base URL",
         key="base_url",
-        placeholder="https://api.groq.com/openai/v1",
+        placeholder="OpenAI Compatible api base_url. ",
         autocomplete="off"
     )
     st.text_input("API Key", key="api_key", type="password", autocomplete="off")
@@ -353,10 +368,8 @@ with st.expander("About & Legal Disclaimer & Privacy"):
     simulates the analytical depth of a Senior Equity Research Analyst.
 
     **Disclaimer**
-    This application is a personal hobby project developed for academic and portfolio purposes to demonstrate the integration of financial data APIs and LLMs avalable openly on puplic domain. The developer is not a SEBI-registered investment advisor, broker, or financial professional just a NOOB developer. This tool is provided "as is" for informational and educational purposes only.
-
-    All financial decisions, trades, or investments made by the user are the sole responsibility of the user. The developer of this application expressly disclaim any and all liability for financial losses, damages, or consequences arising from the use of this tool. AI-generated insights are experimental and contain "hallucinations," inaccuracies, or biased data; they should never be the primary basis for investment decisions.
-
+    This application is a personal hobby project developed for academic and portfolio purposes to demonstrate the integration of financial data APIs and LLMs avalable openly on puplic domain. The developer is not a SEBI-registered investment advisor, broker, or financial professional just a NOOB developer. This tool is provided "as is" for informational and educational purposes only.\n
+    All financial decisions, trades, or investments made by the user are the sole responsibility of the user. The developer of this application expressly disclaim any and all liability for financial losses, damages, or consequences arising from the use of this tool. AI-generated insights are experimental and contain "hallucinations," inaccuracies, or biased data; they should never be the primary basis for investment decisions.\n
     Investing in the NSE/Stock Market involves significant risk. Past performance is not indicative of future results. Users are strongly encouraged to consult with a SEBI-registered financial advisor and perform independent due diligence before committing capital.
 
     **Privacy & Security** This is a serverless, client-side application. Your **API Key is never saved** on any database
@@ -406,10 +419,10 @@ if ticker_input:
         m4.metric("Market Cap", f"₹{data['fundamental'].get('marketCap', 0)//10**7:,} Cr")
 
         # 4. CHART
-        with st.expander("📈 Interactive Technical Chart", expanded=True):
-            fig = plot_stock_with_indicators(valid_ticker)
-            if fig: st.plotly_chart(fig, use_container_width=True)
-
+        with st.expander("📈 Technical Chart", expanded=True):
+            fig = create_stock_chart(valid_ticker)
+            if fig: st.pyplot(fig)
+            st.markdown(f"Goto TradingView Chart [TradingView Charts](https://in.tradingview.com/chart/?symbol=NSE%3A{valid_ticker})")
         # 5. AI ANALYSIS
         if st.session_state.api_key:
             with st.spinner("Generating SEBI-grade research report..."):
